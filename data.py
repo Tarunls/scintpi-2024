@@ -1,157 +1,256 @@
-import os
+import dash
+from dash import dcc, html
 import pandas as pd
-import matplotlib.pyplot as plt
-import time
+import plotly.graph_objects as go
+from dash.dependencies import Input, Output
+from datetime import datetime, timedelta
+from azure.storage.blob import BlobServiceClient
+import io
+import re
 
-# File path for bin2asc.exe
-bin2asc_path = r"bin/sbf2asc/sbf2asc"
+SATELLITE_SYSTEMS = {
+    0: "GPS",
+    1: "SBS",
+    2: "GAL",
+    3: "BDS",
+    5: "QZS",
+    6: "GLO"
+}
 
-# Runs command to convert the binary to ascii and extract measurement.txt files. 
-# Takes the file that you want to convert as a parameter
+AZURE_CONNECTION_STRING = 'ASKFORDOTENV'
+BLOB_CONTAINER = "bulkfiles"
 
-def svid_to_satellite(svid):
-    if 1 <= svid <= 37:
-        return f"G{str(svid).zfill(2)}"  # GPS
-    elif 38 <= svid <= 61:
-        return f"R{str(svid - 37).zfill(2)}"  # GLONASS with offset 37
-    elif svid == 62:
-        return "NA"  # GLONASS with unknown slot number
-    elif 63 <= svid <= 68:
-        return f"R{str(svid - 38).zfill(2)}"  # GLONASS with offset 38
-    elif 71 <= svid <= 106:
-        return f"E{str(svid - 70).zfill(2)}"  # GALILEO with offset 70
-    elif 107 <= svid <= 119:
-        return "NA"  # L-Band (MSS), no specific name given
-    elif 120 <= svid <= 140:
-        return f"S{str(svid - 100).zfill(2)}"  # SBAS with offset 100
-    elif 141 <= svid <= 180:
-        return f"C{str(svid - 140).zfill(2)}"  # BeiDou with offset 140
-    elif 181 <= svid <= 187:
-        return f"J{str(svid - 180).zfill(2)}"  # QZSS with offset 180
-    elif 191 <= svid <= 197:
-        return f"I{str(svid - 190).zfill(2)}"  # NavIC/IRNSS with offset 190
-    elif 198 <= svid <= 215:
-        return f"S{str(svid - 157).zfill(2)}"  # SBAS with offset 157
-    elif 216 <= svid <= 222:
-        return f"I{str(svid - 208).zfill(2)}"  # NavIC/IRNSS with offset 208
-    elif 223 <= svid <= 245:
-        return f"C{str(svid - 182).zfill(2)}"  # BeiDou with offset 182
-    else:
-        return "Unknown SVID"
+blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
+container_client = blob_service_client.get_container_client(BLOB_CONTAINER)
 
-def convert(bin_file):
+# Global cache
+cached_df = None
+last_fetch_time = None
 
-    start = time.time()
-    #os.system(f'cd {bin2asc_path}')
-    os.system(f'{bin2asc_path} -f files/{bin_file} -m -o files/{bin_file[:-4]}')
-    #os.system(f'{bin2asc_path} -f {bin_file} -m')
-    print(f'Time taken is {time.time() - start}')
-    
+app = dash.Dash(__name__)
+server = app.server
 
-# Reads file and puts data into pandas dataframe.
-def read(file):
-    
-    start = time.time()
-    global df
-    gps_epoch = pd.to_datetime('1980-01-06') #gps start time
-    s4=pd.DataFrame()
+def fetch_txt_blobs():
+    blobs = container_client.list_blobs(name_starts_with="log_")
+    txt_streams = []
+    for blob in blobs:
+        if blob.name.endswith(".txt"):
+            blob_client = container_client.get_blob_client(blob.name)
+            stream = io.BytesIO()
+            blob_client.download_blob().readinto(stream)
+            stream.seek(0)
+            txt_streams.append((blob.name, stream))
+    return txt_streams
 
+def parse_log_streams(streams):
+    pattern = re.compile(r"(\w+):\s*([\d\.\-]+)")
+    data_list = []
+    for name, stream in streams:
+        for line in stream.getvalue().decode().splitlines():
+            matches = pattern.findall(line)
+            if matches:
+                data_list.append({key: float(value) if "." in value else int(value) for key, value in matches})
 
-   
-    cols=[0,1,4] #columns of file we want
-    names=['SVID','TOW','SNR']#dataframe namers
-    rows=2 #in case of header skip some vals
-    chunksize = 10 ** 7
-    df=pd.DataFrame()
-    buffer=pd.DataFrame()
-
-    
-    with pd.read_csv(file,header=None,delim_whitespace = True, skiprows=rows, usecols=cols, names=names, chunksize=chunksize) as reader:
-        for chunk in reader:
-            
-            chunk['datetime'] = gps_epoch + pd.to_timedelta(chunk['TOW'], unit='s')
-            chunk.set_index('datetime', inplace=True)
-            chunk.sort_values(by='datetime')
-
-            chunk['linSNR']= 10 ** (chunk['SNR'] / 10) #convert SNR from dB to linear
-            chunk.drop(['TOW', 'SNR'],inplace=True,axis=1)    #remove fields we dont need anymore
-            
-            chunk=pd.concat([chunk,buffer])
-            first_minute = chunk.index.floor('T').min() 
-            last_minute = chunk.index.floor('T').max()
-            buffer=chunk[((chunk.index.floor('T') == last_minute) | (chunk.index.floor('T') == first_minute))]
-            
-            chunk=chunk.groupby(['SVID']).resample('1min')
-            
-            
-            
-            
-            s4=chunk['linSNR'].std()/chunk['linSNR'].mean() #calculate S4
-            df = pd.concat([df, s4])
-            
-            print(f'Time taken is {time.time() - start}')
-            start = time.time()
-            
-    df.reset_index(inplace=True)
-    df[['Satellite', 'Datetime']] = df['index'].apply(pd.Series)
-    df['S4']=df[0]
-    df.set_index('Datetime',inplace=True)
-    df.drop(['index',0],axis=1,inplace=True)
-    
-    df['Satellite'] = df['Satellite'].apply(svid_to_satellite)
-        
+    df = pd.DataFrame(data_list) if data_list else pd.DataFrame()
+    if not df.empty:
+        offset = pd.Timedelta('3657 days 05:00:18')
+        gps_epoch = pd.Timestamp("1980-01-06")
+        leap_seconds = pd.Timedelta(seconds=18)
+        df['datetime'] = pd.to_datetime(df['tow'], unit='s') - offset + leap_seconds
+        df['datetime'] += gps_epoch - pd.Timestamp("1970-01-01")
+        df['system'] = df['const'].map(lambda x: SATELLITE_SYSTEMS.get(x, "Unknown"))
+        return df[['tow', 'datetime', 'PRN', 'const', 'system', 's4', 'elev', 'azim']]
     return df
-# Function to delete all the .txt files at the end
-def clear():
 
-    for file in os.listdir('files/'):
+def get_cached_df():
+    global cached_df, last_fetch_time
+    now = datetime.utcnow()
+    if cached_df is None or last_fetch_time is None or (now - last_fetch_time).total_seconds() > 300:
+        print("Refreshing cache...")
+        streams = fetch_txt_blobs()
+        cached_df = parse_log_streams(streams)
+        last_fetch_time = now
+    else:
+        print("Using cached data...")
+    return cached_df
 
-        if file.endswith("txt"):
+CONTENT_STYLE = {
+    "margin-left": "2rem",
+    "margin-right": "2rem",
+    "padding": "2rem",
+    "backgroundColor": "#1e1e1e"
+}
 
-            os.remove(f'files/{file}')
+app.layout = html.Div([
+    dcc.Interval(id='interval-component-24h', interval=15000, n_intervals=0),
+    dcc.Interval(id='interval-component-sky', interval=15000, n_intervals=0),
 
-# plots all .24_ binary files
+    html.Div(id='last-update-time',
+             style={'color': 'white', 'textAlign': 'right', 'paddingRight': '1rem', "font-family": "Ubuntu, sans-serif"}),
 
-convert('sept311v15.24_')
+    html.H1("ScintPi Real-time Dashboard, Station: UTD (32.99°N, 96.76°W)",
+            style={"textAlign": "center", "color": "white", "marginBottom": "2rem", "paddingTop": "1rem", "font-family": "Ubuntu, sans-serif"}),
 
-data = read('files/sept311v15')
+    html.Div(id='main-graph-container'),
+    html.Div(id='sky-plot-container'),
+], style=CONTENT_STYLE)
 
-data.to_csv(path_or_buf='test.csv')
+@app.callback(
+    Output('last-update-time', 'children'),
+    [Input('interval-component-24h', 'n_intervals'),
+     Input('interval-component-sky', 'n_intervals')]
+)
+def update_last_update_time(n1, n2):
+    now = datetime.now()
+    return f"Last checked for updates: {now.strftime('%Y-%m-%d %H:%M:%S')}"
 
-'''
-def plot_all():
+@app.callback(
+    Output('main-graph-container', 'children'),
+    Input('interval-component-24h', 'n_intervals')
+)
+def update_main_graph(n):
+    df = get_cached_df()
 
-    for file in os.listdir('files/'):
+    if df.empty:
+        return html.Div(
+            html.H3("Waiting for data...", style={"color": "white", "textAlign": "center", "marginTop": "2rem", "font-family": "Ubuntu, sans-serif"})
+        )
 
-            if file.endswith(".24_"):
-                
-                current_file = f'files/{file}'
-                measurement_file = f'{current_file}_measurements.txt'
+    filtered_df = df[df['elev'] >= 30].copy()
+    max_time = filtered_df['datetime'].max()
+    min_time = max_time - timedelta(hours=72)
+    filtered_df = filtered_df[filtered_df['datetime'] > min_time]
+    filtered_df = filtered_df[~((filtered_df['system'] == 'GLO') & (filtered_df['PRN'] == 255))]
 
-                convert(current_file)
-                x = read(measurement_file)
+    if filtered_df.empty:
+        return html.Div(
+            html.H3("No data available above 30° elevation", style={"color": "white", "textAlign": "center", "marginTop": "2rem", "font-family": "Ubuntu, sans-serif"})
+        )
 
-                print(x)
+    scatter_fig = go.Figure()
+    scatter_fig.add_trace(
+        go.Scattergl(
+            x=filtered_df['datetime'],
+            y=filtered_df['s4'],
+            mode='markers',
+            marker=dict(color='#636EFA', size=5),
+            hovertemplate=(
+                "<b>PRN:</b> %{customdata[0]}<br>" +
+                "<b>System:</b> %{customdata[1]}<br>" +
+                "<b>Elevation:</b> %{customdata[2]:.1f}°<br>" +
+                "<b>Azimuth:</b> %{customdata[3]:.1f}°<br>" +
+                "<b>S4:</b> %{y:.4f}<br>" +
+                "<b>Time:</b> %{x|%H:%M:%S}<extra></extra>"
+            ),
+            customdata=filtered_df[['PRN', 'system', 'elev', 'azim']].values
+        )
+    )
 
-                gps1 = x[x['3']=='G01']
+    scatter_fig.update_layout(
+        margin=dict(l=40, r=40, t=60, b=40),
+        paper_bgcolor="#1e1e1e",
+        plot_bgcolor="#1e1e1e",
+        font=dict(color="white", family="Ubuntu, sans-serif"),
+        title="S4",
+        title_x=0.5,
+        xaxis_title="Central Daylight Time (UTC-5)",
+        yaxis_title="S4 Index",
+        showlegend=False,
+        xaxis=dict(range=[min_time, max_time], tickformat='%H:%M \n %Y-%m-%d', gridcolor='rgba(255,255,255,0.1)'),
+        yaxis=dict(range=[0, 1], gridcolor='rgba(255,255,255,0.1)')
+    )
 
-                # List of the types of GPS Frequencies
-                type_list = ['L1','L2','L5']
+    return dcc.Graph(
+        figure=scatter_fig,
+        style={"marginBottom": "2rem", "backgroundColor": "#1e1e1e", "borderRadius": "5px", "padding": "1rem", "height": "70vh"},
+        config={'displayModeBar': True, 'scrollZoom': True, 'doubleClick': 'reset'}
+    )
 
-                # Creates 3 subplots
-                fig, ax = plt.subplots(3)
+@app.callback(
+    Output('sky-plot-container', 'children'),
+    Input('interval-component-sky', 'n_intervals')
+)
+def update_sky_plot(n):
+    df = get_cached_df()
 
-                for i in range(len(type_list)):
+    if df.empty:
+        return html.Div(
+            html.H3("Waiting for data...", style={"color": "white", "textAlign": "center", "marginTop": "2rem", "font-family": "Ubuntu, sans-serif"})
+        )
 
-                    plotter=gps1[gps1['4'].str.contains(type_list[i])]
+    filtered_df = df[df['elev'] >= 30].copy()
+    if filtered_df.empty:
+        return html.Div(
+            html.H3("No data available above 30° elevation", style={"color": "white", "textAlign": "center", "marginTop": "2rem", "font-family": "Ubuntu, sans-serif"})
+        )
 
-                    ax[i].plot(plotter['1'],plotter['9'],label=f'GPS {type_list[i]}')
+    max_time = filtered_df['datetime'].max()
+    last_30_min = max_time - timedelta(minutes=30)
+    polar_df = filtered_df[filtered_df['datetime'] >= last_30_min].copy()
 
-                    ax[i].legend(loc=1)
+    if polar_df.empty:
+        return html.Div(
+            html.H3("No recent data (last 30 minutes)", style={"color": "white", "textAlign": "center", "marginTop": "2rem", "font-family": "Ubuntu, sans-serif"})
+        )
 
-                plt.show()
+    polar_df.loc[:, 'r_sky'] = 90 - polar_df['elev']
 
-                clear()
+    polar_fig = go.Figure()
+    polar_fig.add_trace(
+        go.Scatterpolar(
+            r=polar_df['r_sky'],
+            theta=polar_df['azim'],
+            mode='markers',
+            marker=dict(
+                size=8,
+                color=polar_df['s4'],
+                colorscale='Bluered',
+                cmin=0,
+                cmax=0.3,
+                colorbar=dict(title="S4 Index")
+            ),
+            hovertemplate=(
+                "<b>PRN:</b> %{customdata[0]}<br>" +
+                "<b>System:</b> %{customdata[1]}<br>" +
+                "<b>Elevation:</b> %{customdata[2]:.1f}°<br>" +
+                "<b>Azimuth:</b> %{theta:.1f}°<br>" +
+                "<b>S4:</b> %{marker.color:.4f}<br>" +
+                "<b>Time:</b> %{customdata[3]}<extra></extra>"
+            ),
+            customdata=polar_df[['PRN', 'system', 'elev', 'datetime']].values
+        )
+    )
 
-plot_all()
-'''
+    polar_fig.update_layout(
+        margin=dict(l=40, r=40, t=60, b=40),
+        paper_bgcolor="#1e1e1e",
+        font=dict(color="white", family="Ubuntu, sans-serif"),
+        title="Sky Plot",
+        title_x=0.5,
+        polar=dict(
+            bgcolor="#1e1e1e",
+            angularaxis=dict(
+                direction="clockwise",
+                tickmode="array",
+                tickvals=[0, 90, 180, 270],
+                ticktext=["N", "E", "S", "W"]
+            ),
+            radialaxis=dict(
+                range=[0, 70],
+                tickvals=[0, 30, 60],
+                ticktext=["90°", "60°", "30°"],
+                gridcolor="rgba(255,255,255,0.1)",
+                showline=True,
+                linewidth=1
+            )
+        )
+    )
+
+    return dcc.Graph(
+        figure=polar_fig,
+        style={"marginBottom": "2rem", "backgroundColor": "#1e1e1e", "borderRadius": "5px", "padding": "1rem", "height": "70vh"},
+        config={'displayModeBar': True, 'scrollZoom': True, 'doubleClick': 'reset'}
+    )
+
+if __name__ == "__main__":
+    app.run_server(debug=True)
